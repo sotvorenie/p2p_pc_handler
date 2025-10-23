@@ -22,8 +22,7 @@ from tkinter import messagebox
 
 from screeninfo import get_monitors
 
-
-
+from config import BOT_TOKEN, CHAT_ID, WS_AUTH_TOKEN
 
 
 class ClientWebsocketServer:
