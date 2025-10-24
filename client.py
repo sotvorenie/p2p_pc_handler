@@ -963,12 +963,6 @@ class ClientWebsocketServer:
     # отправка в сон
     async def system_sleep(self):
         try:
-            response = {
-                'status': 'success',
-                'type': 'system_sleep',
-                'data': "✅ Система переходит в спящий режим через 3 секунды..."
-            }
-
             def execute_sleep():
                 time.sleep(3)
                 try:
@@ -980,7 +974,7 @@ class ClientWebsocketServer:
             sleep_thread.daemon = True
             sleep_thread.start()
 
-            return response
+            return "✅ Система переходит в спящий режим через 3 секунды..."
 
         except Exception as e:
             return {
