@@ -24,6 +24,28 @@ from screeninfo import get_monitors
 
 from config import BOT_TOKEN, CHAT_ID, WS_AUTH_TOKEN
 
+from voice_helper import Diana
+
+
+async def main():
+    server = ClientWebsocketServer()
+
+    server_task = asyncio.create_task(server.start_server())
+
+    diana = Diana(server=server)
+
+    diana_task = asyncio.create_task(run_diana_async(diana))
+
+    await asyncio.gather(server_task, diana_task)
+
+
+async def run_diana_async(diana):
+    while True:
+        await asyncio.sleep(0.5)
+        text = await asyncio.to_thread(diana.listen)
+        if text:
+            await asyncio.to_thread(diana.process_lisington_style, text)
+
 
 class ClientWebsocketServer:
     def __init__(self, host='0.0.0.0', port=5555):
@@ -1040,6 +1062,7 @@ class ClientWebsocketServer:
                 'data': f"❌ Ошибка перехода в спящий режим: {e}"
             }
 
+    # выключение ПК
     def system_shutdown(self):
         try:
             os.system("shutdown /s /t 5")
@@ -1047,6 +1070,7 @@ class ClientWebsocketServer:
         except Exception as e:
             return f"Ошибка выключения системы: {e}"
 
+    # закрытие всех программ
     def close_all_programs(self):
         try:
             closed_count = 0
@@ -1085,5 +1109,4 @@ class ClientWebsocketServer:
 
 
 if __name__ == "__main__":
-    server = ClientWebsocketServer()
-    server.start()
+    asyncio.run(main())
