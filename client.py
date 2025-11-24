@@ -17,6 +17,9 @@ import GPUtil
 import winreg
 import time
 
+import win32con
+import win32gui
+import win32process
 from websockets.exceptions import ConnectionClosed
 from tkinter import messagebox
 
@@ -445,6 +448,12 @@ class ClientWebsocketServer:
                 'type': 'kill_program',
                 'data': self.kill_program(data),
             }
+        elif command == 'close_program':
+            return {
+                'status': 'success',
+                'type': 'close_program',
+                'data': self.close_program(data),
+            }
         elif command == 'show_custom_message':
             return {
                 'status': 'success',
@@ -474,6 +483,12 @@ class ClientWebsocketServer:
                 'status': 'success',
                 'type': 'close_all_programs',
                 'data': self.close_all_programs(),
+            }
+        elif command == 'close_all_processes':
+            return {
+                'status': 'success',
+                'type': 'close_all_processes',
+                'data': self.close_all_processes(),
             }
         elif command == 'remove_program':
             return {
@@ -839,7 +854,7 @@ class ClientWebsocketServer:
         except Exception as e:
             return f"❌ Ошибка запуска {program_name}: {e}"
 
-    # закрытие программы по имени
+    # убийство программы по имени
     def kill_program(self, search_name):
         search_name = search_name if isinstance(search_name, str) else search_name.get('data', '')
 
@@ -885,6 +900,24 @@ class ClientWebsocketServer:
             return f"✅ Завершен: {killed[0]}"
         else:
             return f"✅ Завершено процессов: {', '.join(killed)}"
+
+    # закрытие программы по имени
+    def close_program(self, search_name):
+        search_name = search_name.lower()
+
+        def callback(hwnd, found):
+            title = win32gui.GetWindowText(hwnd).lower()
+            if search_name in title and win32gui.IsWindowVisible(hwnd):
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                found.append(hwnd)
+
+        found_windows = []
+        win32gui.EnumWindows(callback, found_windows)
+
+        if not found_windows:
+            return "❌ Окно не найдено"
+
+        return f"✔ Программа закрыта: {len(found_windows)}"
 
     # показ модального окна
     def show_modal_window(self, message_data):
@@ -1070,42 +1103,94 @@ class ClientWebsocketServer:
         except Exception as e:
             return f"Ошибка выключения системы: {e}"
 
-    # закрытие всех программ
-    def close_all_programs(self):
+    # закрытие всех процессов
+    def close_all_processes(self):
         try:
             closed_count = 0
             error_count = 0
 
+            protected = {
+                'explorer.exe', 'taskmgr.exe', 'cmd.exe', 'powershell.exe', 'python.exe', 'py.exe',
+                'system', 'svchost.exe', 'winlogon.exe', 'csrss.exe', 'lsass.exe', 'services.exe',
+                'wininit.exe', 'dwm.exe', 'smss.exe', 'ctfmon.exe', 'fontdrvhost.exe',
+                'searchhost.exe', 'startmenuexperiencehost.exe', 'runtimebroker.exe',
+                'applicationframehost.exe', 'sihost.exe', 'shellexperiencehost.exe',
+                'windowsinternal.composable.experiences.textinput.inputapp.exe'
+            }
+
+            my_pid = os.getpid()
+
             for proc in psutil.process_iter(['pid', 'name', 'username']):
                 try:
-                    username = proc.info.get('username', '')
-                    proc_name = proc.info['name'].lower()
+                    name = (proc.info['name'] or '').lower()
+                    username = (proc.info.get('username') or '').lower()
 
-                    system_processes = {
-                        'explorer', 'taskmgr', 'cmd', 'powershell', 'python', 'py',
-                        'system', 'svchost', 'winlogon', 'csrss', 'lsass', 'services',
-                        'wininit', 'dwm', 'ctfmon', 'searchui', 'runtimebroker'
-                    }
+                    if proc.pid == my_pid:
+                        continue
 
-                    if (username and not ('SYSTEM' in username or 'AUTHORITY' in username) and
-                            proc_name not in system_processes and
-                            proc.pid != os.getpid()):
+                    if 'system' in username or 'authority' in username:
+                        continue
 
-                        proc.terminate()
-                        time.sleep(0.1)
-                        if proc.is_running():
-                            proc.kill()
+                    # Пропускаем защищённые процессы
+                    if name in protected:
+                        continue
 
-                        closed_count += 1
+                    if proc.pid in (0, 4):
+                        continue
+
+                    proc.terminate()
+                    time.sleep(0.1)
+
+                    if proc.is_running():
+                        proc.kill()
+
+                    closed_count += 1
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     error_count += 1
                     continue
 
-            return f"✅ Закрыто {closed_count} программ (ошибок: {error_count})"
+            return f"Закрыто {closed_count} процессов (ошибок: {error_count})"
 
         except Exception as e:
-            return f"❌ Ошибка закрытия всех программ: {str(e)}"
+            return f"Ошибка: {str(e)}"
+
+    # закрытие всех программ
+    def close_all_programs(self):
+        closed = 0
+        errors = 0
+
+        def callback(hwnd, _):
+            nonlocal closed, errors
+
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+
+            title = win32gui.GetWindowText(hwnd)
+            if not title.strip():
+                return
+
+            if win32gui.GetWindow(hwnd, win32con.GW_OWNER) != 0:
+                return
+
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                proc = psutil.Process(pid)
+
+                if any(sys in proc.name().lower() for sys in [
+                    "explorer", "system", "winlogon", "csrss", "services",
+                    "svchost", "runtimebroker"
+                ]):
+                    return
+
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                closed += 1
+
+            except Exception:
+                errors += 1
+
+        win32gui.EnumWindows(callback, None)
+        return f"Закрыто окон: {closed} (ошибок: {errors})"
 
 
 if __name__ == "__main__":
